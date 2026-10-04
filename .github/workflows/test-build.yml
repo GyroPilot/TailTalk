@@ -1,0 +1,32 @@
+# Fork-only helper: builds a Windows installer of this branch for hardware
+# testing. Not part of the upstream pull request.
+name: Test build (Windows)
+
+on:
+  push:
+    branches: [ "test-build" ]
+  workflow_dispatch:
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Npcap SDK
+      shell: pwsh
+      run: |
+        Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "$env:TEMP\npcap-sdk.zip"
+        Expand-Archive -Path "$env:TEMP\npcap-sdk.zip" -DestinationPath "C:\npcap-sdk"
+        "LIB=C:\npcap-sdk\Lib\x64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    - name: Install cargo-packager
+      run: cargo install cargo-packager --locked
+    - name: Build release
+      run: cargo build --release -p tailtalk-gui
+    - name: Build NSIS installer
+      run: cargo packager --release -f nsis -p tailtalk-gui
+    - name: Upload installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: tailtalk-windows-zoned-lookup-test
+        path: dist/*.exe
+        if-no-files-found: error
