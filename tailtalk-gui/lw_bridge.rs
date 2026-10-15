@@ -59,6 +59,22 @@ impl ForwardFormat {
     }
 }
 
+/// How jobs are handed to one printer: the format it takes and, for a raster
+/// format, the resolution, colour and quality it accepts.
+#[derive(Clone, Copy, Debug)]
+struct Forwarding {
+    format: ForwardFormat,
+    dpi: u32,
+    color: bool,
+    urf_quality: u8,
+}
+
+impl Forwarding {
+    fn for_printer(caps: &IppCaps) -> Self {
+        Self { format: caps.format, dpi: caps.dpi, color: caps.color, urf_quality: caps.urf_quality }
+    }
+}
+
 /// Capabilities pulled from the real printer via Get-Printer-Attributes.
 #[derive(Debug)]
 struct IppCaps {
@@ -67,6 +83,8 @@ struct IppCaps {
     dpi: u32,
     paper_sizes: Vec<PaperSize>,
     format: ForwardFormat,
+    /// `print-quality` value written into URF pages: 3 draft, 4 normal, 5 high.
+    urf_quality: u8,
 }
 
 impl Default for IppCaps {
@@ -80,6 +98,7 @@ impl Default for IppCaps {
             dpi: 300,
             paper_sizes: vec![PaperSize::Letter, PaperSize::A4],
             format: ForwardFormat::Pdf,
+            urf_quality: 4,
         }
     }
 }
@@ -143,7 +162,11 @@ pub async fn run(
                             continue;
                         };
                         let rp = info.get_property_val_str("rp").unwrap_or("");
-                        let uri_str = format!("ipp://{ip}:{}/{rp}", info.get_port());
+                        // A `TLS` key in the TXT record (Bonjour Printing spec) means the
+                        // printer takes IPP over TLS; some, like Epson's, take nothing else.
+                        let tls = info.get_property("TLS").is_some();
+                        let candidates = candidate_uris(&ip.to_string(), info.get_port(), rp, tls);
+                        let uri_str = candidates[0].clone();
 
                         match printers.get(&fullname) {
                             Some(existing) if existing.uri == uri_str => continue,
@@ -159,24 +182,17 @@ pub async fn run(
                         let _info = info.clone();
 
                         tokio::spawn(async move {
-                            let uri: Uri = match uri_str.parse() {
-                                Ok(u) => u,
-                                Err(e) => {
-                                    tracing::warn!("LW bridge: bad URI '{uri_str}': {e}");
-                                    return;
-                                }
-                            };
-
-                            let caps = match query_ipp_caps(&uri).await {
-                                Ok(c) => c,
-                                Err(e) => {
+                            let (uri, caps) = match probe_printer(&instance, &candidates).await {
+                                Some(found) => found,
+                                None => {
+                                    let Ok(uri) = uri_str.parse::<Uri>() else {
+                                        tracing::warn!("LW bridge: bad URI '{uri_str}'");
+                                        return;
+                                    };
                                     tracing::warn!(
-                                        "LW bridge: attribute query for '{instance}' failed ({e}), using defaults"
+                                        "LW bridge: attribute query for '{instance}' failed, using defaults"
                                     );
-                                    IppCaps {
-                                        make_and_model: instance.clone(),
-                                        ..IppCaps::default()
-                                    }
+                                    (uri, IppCaps { make_and_model: instance.clone(), ..IppCaps::default() })
                                 }
                             };
 
@@ -225,9 +241,7 @@ pub async fn run(
 
                             let sink = IppForwardSink {
                                 uri,
-                                format: caps.format,
-                                dpi: caps.dpi,
-                                color: caps.color,
+                                forwarding: Forwarding::for_printer(&caps),
                                 printer: nbp_name.clone(),
                                 serial: Arc::new(tokio::sync::Mutex::new(())),
                                 counter: std::sync::atomic::AtomicU32::new(0),
@@ -376,8 +390,176 @@ fn attr_values(v: &IppValue) -> Vec<&IppValue> {
     }
 }
 
+/// Dots per inch of an IPP resolution value (cross-feed direction).
+fn resolution_dpi(v: &IppValue) -> Option<u32> {
+    match v {
+        IppValue::Resolution { cross_feed, units, .. } if *cross_feed > 0 => {
+            if *units == 4 {
+                Some((*cross_feed as f64 * 2.54).round() as u32)
+            } else {
+                Some(*cross_feed as u32)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The resolutions a printer's `urf-supported` keywords allow: `RS300` is one,
+/// `RS300-600` several, dash-separated.
+fn urf_resolutions<'a>(keywords: impl IntoIterator<Item = &'a str>) -> Vec<u32> {
+    keywords
+        .into_iter()
+        .filter_map(|k| k.strip_prefix("RS"))
+        .flat_map(|list| list.split('-').filter_map(|n| n.parse::<u32>().ok()).collect::<Vec<_>>())
+        .collect()
+}
+
+/// The print qualities a printer's `urf-supported` keywords allow: `PQ4-5` is 4 and 5.
+fn urf_qualities<'a>(keywords: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
+    keywords
+        .into_iter()
+        .filter_map(|k| k.strip_prefix("PQ"))
+        .flat_map(|list| list.split('-').filter_map(|n| n.parse::<u8>().ok()).collect::<Vec<_>>())
+        .collect()
+}
+
+/// Normal quality (4) when the printer takes it or says nothing, else its lowest.
+fn pick_urf_quality(supported: &[u8]) -> u8 {
+    if supported.is_empty() || supported.contains(&4) {
+        4
+    } else {
+        supported.iter().copied().min().unwrap_or(4)
+    }
+}
+
+/// Fix up a URF stream from Ghostscript so AirPrint printers accept it.
+///
+/// Ghostscript's `urfgray`/`urfrgb` devices write a header that printers reject
+/// as a document-format-error: the colour space is marked as device gray or
+/// device RGB (4 and 5, the `DEVW8`/`DEVRGB24` keywords few printers list), the
+/// duplex and quality fields are 0 (not a value either takes), and the page
+/// count is 0. Set the colour space to W (0) or sRGB (1), which every URF printer
+/// lists, duplex to one-sided (1), the quality to what the printer announced, and
+/// the page count to the pages found. Pages are found by decoding the run
+/// lengths, since the format has no page table.
+fn urf_conform(data: &mut [u8], color: bool, quality: u8) -> anyhow::Result<()> {
+    let headers = urf_page_headers(data)?;
+    let count = u32::try_from(headers.len())?;
+    data[8..12].copy_from_slice(&count.to_be_bytes());
+    for at in headers {
+        data[at + 1] = if color { 1 } else { 0 };
+        data[at + 2] = 1;
+        data[at + 3] = quality;
+    }
+    Ok(())
+}
+
+/// Byte offsets of the page headers in a URF stream.
+///
+/// Each page is a 32-byte header followed by its lines: a repeat byte (lines − 1),
+/// then runs until the width is covered: `n < 128` repeats the next pixel n + 1
+/// times, `n > 128` is followed by 257 − n literal pixels, and 128 blanks the rest
+/// of the line.
+fn urf_page_headers(data: &[u8]) -> anyhow::Result<Vec<usize>> {
+    anyhow::ensure!(data.len() >= 12 && &data[..8] == b"UNIRAST\0", "not a URF stream");
+    let mut headers = Vec::new();
+    let mut pos = 12;
+    let byte_at = |at: usize| data.get(at).copied().ok_or_else(|| anyhow::anyhow!("truncated URF page"));
+    let u32_at = |at: usize| -> anyhow::Result<usize> {
+        let b: [u8; 4] = data.get(at..at + 4).ok_or_else(|| anyhow::anyhow!("truncated URF page header"))?.try_into()?;
+        Ok(u32::from_be_bytes(b) as usize)
+    };
+    while pos < data.len() {
+        let bytes_per_pixel = byte_at(pos)? as usize / 8;
+        let width = u32_at(pos + 12)?;
+        let height = u32_at(pos + 16)?;
+        anyhow::ensure!(bytes_per_pixel > 0 && width > 0 && height > 0, "bad URF page header");
+        headers.push(pos);
+        pos += 32;
+        let mut lines = 0;
+        while lines < height {
+            lines += byte_at(pos)? as usize + 1;
+            pos += 1;
+            let mut pixels = 0;
+            while pixels < width {
+                let n = byte_at(pos)?;
+                pos += 1;
+                if n == 128 {
+                    pixels = width;
+                } else if n < 128 {
+                    pixels += n as usize + 1;
+                    pos += bytes_per_pixel;
+                } else {
+                    let literal = 257 - n as usize;
+                    pixels += literal;
+                    pos += literal * bytes_per_pixel;
+                }
+            }
+            anyhow::ensure!(pos <= data.len(), "truncated URF page");
+        }
+    }
+    Ok(headers)
+}
+
+/// The resolution to render a raster job at: the printer's default when it takes
+/// it, else the highest supported one below it, else the lowest supported one.
+/// With nothing known, the default stands.
+fn pick_raster_dpi(default: u32, supported: &[u32]) -> u32 {
+    if supported.is_empty() || supported.contains(&default) {
+        return default;
+    }
+    supported
+        .iter()
+        .copied()
+        .filter(|&d| d < default)
+        .max()
+        .or_else(|| supported.iter().copied().min())
+        .unwrap_or(default)
+}
+
+/// The URIs to try for a discovered printer, best first.
+///
+/// `ipp://` is what the Bonjour record describes, but a printer that announces `TLS`
+/// may refuse plain IPP (HTTP 426 Upgrade Required) and only serve `ipps://` on the
+/// same port, so that goes first when it is announced. The other scheme stays as a
+/// fallback either way: a printer that announces TLS but has it misconfigured still
+/// gets bridged over plain IPP.
+fn candidate_uris(ip: &str, port: u16, rp: &str, tls: bool) -> Vec<String> {
+    let plain = format!("ipp://{ip}:{port}/{rp}");
+    let secure = format!("ipps://{ip}:{port}/{rp}");
+    if tls { vec![secure, plain] } else { vec![plain, secure] }
+}
+
+/// A client for one printer. Printers present self-signed certificates, so TLS
+/// errors are ignored: the point of `ipps://` here is reaching a printer that
+/// refuses anything else, not authenticating it.
+fn ipp_client(uri: &Uri) -> AsyncIppClient {
+    AsyncIppClient::builder(uri.clone()).ignore_tls_errors(true).build()
+}
+
+/// Ask each candidate URI for the printer's attributes and keep the first that answers.
+async fn probe_printer(instance: &str, candidates: &[String]) -> Option<(Uri, IppCaps)> {
+    for uri_str in candidates {
+        let uri: Uri = match uri_str.parse() {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("LW bridge: bad URI '{uri_str}': {e}");
+                continue;
+            }
+        };
+        match query_ipp_caps(&uri).await {
+            Ok(caps) => {
+                tracing::info!("LW bridge: '{instance}' answers at {uri_str}");
+                return Some((uri, caps));
+            }
+            Err(e) => tracing::info!("LW bridge: '{instance}' did not answer at {uri_str}: {e}"),
+        }
+    }
+    None
+}
+
 async fn query_ipp_caps(uri: &Uri) -> anyhow::Result<IppCaps> {
-    let client = AsyncIppClient::new(uri.clone());
+    let client = ipp_client(uri);
     let op = IppOperationBuilder::get_printer_attributes(uri.clone())
         .attributes([
             "printer-make-and-model",
@@ -385,6 +567,8 @@ async fn query_ipp_caps(uri: &Uri) -> anyhow::Result<IppCaps> {
             "printer-resolution-default",
             "media-supported",
             "document-format-supported",
+            "urf-supported",
+            "pwg-raster-document-resolution-supported",
         ])
         .build()?;
     let resp = tokio::time::timeout(Duration::from_secs(15), client.send(op))
@@ -479,12 +663,37 @@ async fn query_ipp_caps(uri: &Uri) -> anyhow::Result<IppCaps> {
         ForwardFormat::Pdf
     };
 
+    // A raster job is rendered here, so it has to be at a resolution the printer
+    // takes for that raster format, which is not always its default: the Epson
+    // ET-4750 defaults to 600 dpi but accepts URF at 300 only (`RS300`), and
+    // rejects a 600 dpi page as a document-format-error (0x0411).
+    let urf: Vec<String> = attrs
+        .get("urf-supported")
+        .map(|a| attr_values(a.value()).into_iter().filter_map(attr_string).collect())
+        .unwrap_or_default();
+    let urf_quality = pick_urf_quality(&urf_qualities(urf.iter().map(String::as_str)));
+    let dpi = match format {
+        ForwardFormat::Urf => {
+            let supported = urf_resolutions(urf.iter().map(String::as_str));
+            pick_raster_dpi(dpi, &supported)
+        }
+        ForwardFormat::PwgRaster => {
+            let supported: Vec<u32> = attrs
+                .get("pwg-raster-document-resolution-supported")
+                .map(|a| attr_values(a.value()).into_iter().filter_map(resolution_dpi).collect())
+                .unwrap_or_default();
+            pick_raster_dpi(dpi, &supported)
+        }
+        ForwardFormat::Postscript | ForwardFormat::Pdf => dpi,
+    };
+
     Ok(IppCaps {
         make_and_model,
         color,
         dpi,
         paper_sizes,
         format,
+        urf_quality,
     })
 }
 
@@ -492,9 +701,7 @@ async fn query_ipp_caps(uri: &Uri) -> anyhow::Result<IppCaps> {
 
 struct IppForwardSink {
     uri: Uri,
-    format: ForwardFormat,
-    dpi: u32,
-    color: bool,
+    forwarding: Forwarding,
     printer: String,
     /// Serialises forwarded jobs so two quick prints can't arrive out of order.
     serial: Arc<Mutex<()>>,
@@ -508,9 +715,7 @@ impl PrintSink for IppForwardSink {
         job: PrintJob,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         let uri = self.uri.clone();
-        let format = self.format;
-        let dpi = self.dpi;
-        let color = self.color;
+        let forwarding = self.forwarding;
         let printer = self.printer.clone();
         let serial = self.serial.clone();
         // A prologue download is not a document; keep it for the jobs that reference
@@ -529,7 +734,7 @@ impl PrintSink for IppForwardSink {
             // failure here can only be logged.
             tokio::spawn(async move {
                 let _guard = serial.lock().await;
-                match forward_job(&uri, format, dpi, color, job.data, prep, n).await {
+                match forward_job(&uri, forwarding, job.data, prep, n).await {
                     Ok(job_id) => tracing::info!(
                         "LW bridge: job {n} for '{printer}' submitted (IPP job {job_id})"
                     ),
@@ -558,13 +763,12 @@ fn ps_title(data: &[u8]) -> Option<String> {
 
 async fn forward_job(
     uri: &Uri,
-    format: ForwardFormat,
-    dpi: u32,
-    color: bool,
+    forwarding: Forwarding,
     ps: Vec<u8>,
     prep: Option<Vec<u8>>,
     n: u32,
 ) -> anyhow::Result<i32> {
+    let Forwarding { format, dpi, color, urf_quality } = forwarding;
     let title = ps_title(&ps).unwrap_or_else(|| format!("TailTalk job {n}"));
 
     let doc = match format {
@@ -579,7 +783,9 @@ async fn forward_job(
         ForwardFormat::Pdf => gs_convert(&ps, prep.as_deref(), "pdfwrite", &[]).await?,
         ForwardFormat::Urf => {
             let device = if color { "urfrgb" } else { "urfgray" };
-            gs_convert(&ps, prep.as_deref(), device, &[format!("-r{dpi}")]).await?
+            let mut raster = gs_convert(&ps, prep.as_deref(), device, &[format!("-r{dpi}")]).await?;
+            urf_conform(&mut raster, color, urf_quality)?;
+            raster
         }
         ForwardFormat::PwgRaster => {
             gs_convert(&ps, prep.as_deref(), "pwgraster", &[format!("-r{dpi}")]).await?
@@ -593,7 +799,7 @@ async fn forward_job(
         .document_format(format.mime())
         .build()?;
 
-    let client = AsyncIppClient::new(uri.clone());
+    let client = ipp_client(uri);
     let resp = tokio::time::timeout(Duration::from_secs(300), client.send(op))
         .await
         .map_err(|_| anyhow::anyhow!("Print-Job timed out"))??;
@@ -980,9 +1186,81 @@ mod tests {
         assert_eq!(unique_nbp_name("Printer", &taken), "Printer 2");
     }
 
+    /// A URF stream as Ghostscript writes it: `pages` pages of 3 × 2 gray pixels.
+    fn gs_style_urf(pages: usize) -> Vec<u8> {
+        let mut v = b"UNIRAST\0".to_vec();
+        v.extend_from_slice(&0u32.to_be_bytes());
+        for _ in 0..pages {
+            let mut header = [0u8; 32];
+            header[0] = 8;
+            header[1] = 4; // device gray, as Ghostscript marks it
+            header[12..16].copy_from_slice(&3u32.to_be_bytes());
+            header[16..20].copy_from_slice(&2u32.to_be_bytes());
+            header[20..24].copy_from_slice(&300u32.to_be_bytes());
+            v.extend_from_slice(&header);
+            v.extend_from_slice(&[1, 2, 0xff]); // both lines: three white pixels
+        }
+        v
+    }
+
+    #[test]
+    fn urf_pages_are_found_and_their_headers_corrected() {
+        let mut urf = gs_style_urf(2);
+        assert_eq!(urf_page_headers(&urf).unwrap(), [12, 12 + 35]);
+        urf_conform(&mut urf, false, 5).unwrap();
+        assert_eq!(&urf[8..12], &2u32.to_be_bytes());
+        for at in [12, 47] {
+            assert_eq!(&urf[at..at + 4], &[8, 0, 1, 5], "page header at {at}");
+        }
+        let mut colour = gs_style_urf(1);
+        urf_conform(&mut colour, true, 4).unwrap();
+        assert_eq!(&colour[12..16], &[8, 1, 1, 4]);
+    }
+
+    #[test]
+    fn a_cut_short_urf_stream_is_refused() {
+        let urf = gs_style_urf(1);
+        assert!(urf_page_headers(&urf[..urf.len() - 1]).is_err());
+        assert!(urf_page_headers(b"not urf").is_err());
+    }
+
+    #[test]
+    fn urf_quality_comes_from_what_the_printer_takes() {
+        assert_eq!(urf_qualities(["CP1", "PQ4-5", "W8"]), [4, 5]);
+        assert_eq!(urf_qualities(["PQ5"]), [5]);
+        assert_eq!(pick_urf_quality(&[4, 5]), 4);
+        assert_eq!(pick_urf_quality(&[5]), 5);
+        assert_eq!(pick_urf_quality(&[3, 5]), 3);
+        assert_eq!(pick_urf_quality(&[]), 4);
+    }
+
+    #[test]
+    fn raster_resolution_comes_from_what_the_printer_takes() {
+        // The ET-4750: default 600, URF at 300 only.
+        assert_eq!(urf_resolutions(["CP1", "RS300", "W8"]), [300]);
+        assert_eq!(urf_resolutions(["RS300-600", "V1.4"]), [300, 600]);
+        assert_eq!(pick_raster_dpi(600, &[300]), 300);
+        assert_eq!(pick_raster_dpi(600, &[300, 600]), 600);
+        assert_eq!(pick_raster_dpi(300, &[600, 1200]), 600);
+        assert_eq!(pick_raster_dpi(600, &[]), 600);
+    }
+
+    #[test]
+    fn plain_ipp_first_unless_the_printer_announces_tls() {
+        assert_eq!(
+            candidate_uris("192.168.1.9", 631, "ipp/print", false),
+            ["ipp://192.168.1.9:631/ipp/print", "ipps://192.168.1.9:631/ipp/print"]
+        );
+        assert_eq!(
+            candidate_uris("192.168.1.9", 631, "ipp/print", true),
+            ["ipps://192.168.1.9:631/ipp/print", "ipp://192.168.1.9:631/ipp/print"]
+        );
+    }
+
     /// Live query against a real printer, e.g.:
     ///   TAILTALK_TEST_IPP_URI=ipp://printer.local:631/ipp/print \
     ///     cargo test -p tailtalk-gui live_ipp_caps -- --ignored --nocapture
+    /// An `ipps://` URI exercises the TLS path.
     #[tokio::test]
     #[ignore]
     async fn live_ipp_caps() {
@@ -990,6 +1268,30 @@ mod tests {
             .expect("set TAILTALK_TEST_IPP_URI to run this test");
         let caps = query_ipp_caps(&uri.parse().unwrap()).await.unwrap();
         println!("caps: {caps:?}");
+    }
+
+    /// Prints one page on a real printer, converted the way a bridged job would be:
+    ///   TAILTALK_TEST_IPP_URI=ipps://printer.local:631/ipp/print \
+    ///     cargo test -p tailtalk-gui live_ipp_print -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_ipp_print() {
+        let uri: Uri = std::env::var("TAILTALK_TEST_IPP_URI")
+            .expect("set TAILTALK_TEST_IPP_URI to run this test")
+            .parse()
+            .unwrap();
+        let caps = query_ipp_caps(&uri).await.unwrap();
+        println!("caps: {caps:?}");
+        let ps = concat!(
+            "%!PS-Adobe-3.0\n%%Title: TailTalk live_ipp_print\n",
+            "/Helvetica findfont 24 scalefont setfont\n",
+            "72 700 moveto (TailTalk: printed straight to the printer over IPP) show\n",
+            "72 660 moveto (no relay, no driver) show\nshowpage\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let job = forward_job(&uri, Forwarding::for_printer(&caps), ps, None, 1).await.unwrap();
+        println!("submitted as IPP job {job}");
     }
 
     /// Skipped where Ghostscript isn't installed, since there is nothing to ask.
